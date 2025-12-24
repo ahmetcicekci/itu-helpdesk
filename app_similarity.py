@@ -100,21 +100,81 @@ def get_sentence_embeddings(texts, model, tokenizer):
     return sum_embeddings / sum_mask
 
 
-def build_faq_embeddings(itu_help, model, tokenizer):
-    texts = itu_help["content_combined"].to_list()
-    embeddings = get_sentence_embeddings(texts, model, tokenizer)
-    return embeddings
+def build_faq_embeddings(itu_help: pl.DataFrame, model, tokenizer):
+    title_texts = itu_help["title_normalized"].to_list()
+    content_texts = itu_help["content_combined"].to_list()
+
+    title_embeddings = get_sentence_embeddings(title_texts, model, tokenizer)
+    content_embeddings = get_sentence_embeddings(content_texts, model, tokenizer)
+
+    return {
+        "title_embeddings": title_embeddings,
+        "content_embeddings": content_embeddings,
+        "content_idxs": list(range(len(itu_help))),
+        "titles": itu_help["title"].to_list(),
+        "contents": itu_help["content_cleaned"].to_list(),
+        "content_combined": content_texts,
+    }
 
 
 # -----------------------------
 # Similarity search function
 # -----------------------------
-def find_similar_FAQs(query, texts, embeddings, model, tokenizer, top_k=5):
-    query_emb = get_sentence_embeddings([query], model, tokenizer)
-    sims = cosine_similarity(query_emb, embeddings)[0]
-    top_idx = np.argsort(sims)[-top_k:][::-1]
+def find_similar_FAQs(
+    query,
+    title_embeddings,
+    content_embeddings,
+    content_idxs,
+    content_combined,
+    model,
+    tokenizer,
+    top_k=5,
+    threshold=0.7,
+):
+    query_embedding = get_sentence_embeddings([query], model, tokenizer)
 
-    return [{"score": float(sims[i]), "content": texts[i]} for i in top_idx]
+    # --- TITLE SIMILARITY ---
+    title_similarities = cosine_similarity(
+        query_embedding.reshape(1, -1), title_embeddings
+    )[0]
+
+    top_k_indices = np.argsort(title_similarities)[-top_k:][::-1]
+    top_k_similarities = title_similarities[top_k_indices]
+
+    valid_indices = [
+        top_k_indices[i]
+        for i in range(len(top_k_indices))
+        if top_k_similarities[i] > threshold
+    ]
+
+    valid_similarities = [
+        top_k_similarities[i]
+        for i in range(len(top_k_similarities))
+        if top_k_similarities[i] > threshold
+    ]
+
+    search_methods = ["title"] * len(valid_indices)
+
+    # --- FALLBACK TO CONTENT ---
+    if len(valid_indices) < top_k:
+        content_similarities = cosine_similarity(
+            query_embedding.reshape(1, -1), content_embeddings
+        )[0]
+
+        fallback_indices = np.argsort(content_similarities)[::-1]
+        fallback_indices = [idx for idx in fallback_indices if idx not in valid_indices]
+
+        needed = top_k - len(valid_indices)
+        fallback_indices = fallback_indices[:needed]
+
+        valid_indices += fallback_indices
+        valid_similarities += list(content_similarities[fallback_indices])
+        search_methods += ["combined"] * len(fallback_indices)
+
+    top_k_idxs = [content_idxs[i] for i in valid_indices]
+    top_k_contents = [content_combined[i] for i in valid_indices]
+
+    return valid_indices, valid_similarities, top_k_idxs, top_k_contents, search_methods
 
 
 # -----------------------------
@@ -146,17 +206,29 @@ def load_model():
 # -----------------------------
 @st.cache_resource
 def load_pipeline(jsonl_path):
+    # 1. Load + preprocess
     itu_help = load_data(jsonl_path)
     itu_help = preprocess(itu_help)
 
     titles = itu_help["title"].to_list()
     contents = itu_help["content_cleaned"].to_list()
-    texts = itu_help["content_combined"].to_list()
 
+    title_texts = itu_help["title_normalized"].to_list()
+    content_texts = itu_help["content_combined"].to_list()
+
+    # 2. Load model
     tokenizer, model = load_model()
+    model.eval()
 
-    embeddings = get_sentence_embeddings(
-        texts,
+    # 3. Build embeddings
+    title_embeddings = get_sentence_embeddings(
+        title_texts,
+        model,
+        tokenizer,
+    )
+
+    content_embeddings = get_sentence_embeddings(
+        content_texts,
         model,
         tokenizer,
     )
@@ -164,7 +236,10 @@ def load_pipeline(jsonl_path):
     return {
         "titles": titles,
         "contents": contents,
-        "embeddings": embeddings,
+        "content_combined": content_texts,
+        "content_idxs": list(range(len(titles))),
+        "title_embeddings": title_embeddings,
+        "content_embeddings": content_embeddings,
         "model": model,
         "tokenizer": tokenizer,
     }
@@ -174,31 +249,31 @@ PIPELINE = load_pipeline("itu_help_data.jsonl")
 
 
 # -----------------------------
-# Search similar FAQs
+# Search similar FAQs (HYBRID)
 # -----------------------------
 def search_similar(query: str, top_k=5):
     query_norm = normalize_turkish_text(query)
 
-    query_emb = get_sentence_embeddings(
-        [query_norm],
+    indices, similarities, _, _, methods = find_similar_FAQs(
+        query_norm,
+        PIPELINE["title_embeddings"],
+        PIPELINE["content_embeddings"],
+        PIPELINE["content_idxs"],
+        PIPELINE["content_combined"],
         PIPELINE["model"],
         PIPELINE["tokenizer"],
+        top_k=top_k,
     )
-
-    sims = cosine_similarity(
-        query_emb,
-        PIPELINE["embeddings"],
-    )[0]
-
-    top_idx = np.argsort(sims)[-top_k:][::-1]
 
     results = []
 
-    for i in top_idx:
+    for idx, i in enumerate(indices):
         results.append(
             {
                 "title": PIPELINE["titles"][i],
                 "content": PIPELINE["contents"][i],
+                "score": similarities[idx],
+                "method": methods[idx],  # "title" veya "combined"
             }
         )
 
